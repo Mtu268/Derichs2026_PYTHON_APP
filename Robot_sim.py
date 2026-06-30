@@ -1,1123 +1,771 @@
 import pygame
-import socket
 import json
 import math
 
+# Bộ lọc thử nghiệm import thư viện Serial hỗ trợ truyền nhận dữ liệu qua cáp USB
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("[WARNING] Thư viện 'pyserial' chưa được cài đặt trên máy tính.")
+    print("Vui lòng chạy lệnh: 'pip install pyserial' để kích hoạt telemetry qua cáp USB.")
+
 # =========================================
-# INIT
+# KHỞI TẠO HỆ THỐNG ĐỒ HỌA PYGAME
 # =========================================
 pygame.init()
 
 # =========================================
-# FULLSCREEN
+# CẤU HÌNH ĐỒ HỌA TOÀN MÀN HÌNH (FULLSCREEN)
 # =========================================
 info = pygame.display.Info()
-
 WIDTH = info.current_w
 HEIGHT = info.current_h
+
+# ĐỊNH NGHĨA BIẾN TOÀN CỤC: Tọa độ Y của nhóm nút bấm chính để tránh lỗi NameError
+BUTTON_Y = HEIGHT - 180 
 
 screen = pygame.display.set_mode(
     (WIDTH, HEIGHT),
     pygame.FULLSCREEN
 )
 
-pygame.display.set_caption("AGV ROBOT SIMULATOR")
-
+pygame.display.set_caption("AGV ROBOT TELEMETRY & SIMULATOR")
 clock = pygame.time.Clock()
 
 font = pygame.font.SysFont("Arial", 18)
 big_font = pygame.font.SysFont("Arial", 30)
+tab_font = pygame.font.SysFont("Arial", 15, bold=True)
 
 # =========================================
-# UDP
+# KẾT NỐI SERIAL RECEIVER (TỰ ĐỘNG DÒ HOẶC CHỈ ĐỊNH)
 # =========================================
-UDP_IP = "0.0.0.0"
-UDP_PORT = 4210
+# Đặt thành "AUTO" để tự quét, hoặc đổi thành cổng COM cứng (Ví dụ: "COM3", "COM4")
+SERIAL_PORT = "/dev/cu.usbserial-0001" 
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-sock.setblocking(False)
+ser = None
+connected_status = False
+last_packet_time = 0
+
+def find_and_connect_serial():
+    global ser, connected_status
+    if not SERIAL_AVAILABLE:
+        return
+    if ser is not None and ser.is_open:
+        return
+    
+    # 1. Thử kết nối cổng COM chỉ định trước
+    if SERIAL_PORT != "AUTO":
+        try:
+            ser = serial.Serial(SERIAL_PORT, 115200, timeout=0.05)
+            print(f"[SERIAL] Kết nối thành công tới cổng chỉ định: {SERIAL_PORT}")
+            connected_status = True
+            return
+        except Exception as e:
+            print(f"[WARNING] Không thể mở cổng chỉ định {SERIAL_PORT}: {e}. Đang tự động quét tìm cổng thay thế...")
+    
+    # 2. Quét tự động cổng COM khả dụng (Fallback Mode)
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        device_lower = p.device.lower()
+        desc_lower = p.description.lower()
+        if "usb" in device_lower or "ch34" in desc_lower or "cp21" in desc_lower or "ftdi" in desc_lower or "com" in device_lower or "usb" in desc_lower:
+            try:
+                ser = serial.Serial(p.device, 115200, timeout=0.05)
+                print(f"[SERIAL] Tự động quét và kết nối thành công tới cổng: {p.device}")
+                connected_status = True
+                return
+            except Exception as e:
+                pass
+
+if SERIAL_AVAILABLE:
+    find_and_connect_serial()
 
 # =========================================
-# COLORS
+# MÀU SẮC GIAO DIỆN (UI COLOR SCHEME)
 # =========================================
 BG = (8, 10, 15)
 GRID = (22, 25, 35)
 PANEL = (18, 20, 28)
+TAB_ACTIVE = (0, 170, 255)
+TAB_INACTIVE = (35, 38, 50)
 
-WHITE = (240,240,240)
-GREEN = (0,255,120)
-BLUE = (0,170,255)
-RED = (255,80,80)
-GRAY = (70,70,70)
-BLACK_LINE = (15,15,15)
-
-# =========================================
-# ROBOT STATE
-# =========================================
-robot_x = 250
-robot_y = 350
-robot_yaw = 0
-
-front_distance = 20
-back_distance = 30
-
-front_sensor = [0]*8
-back_sensor = [0]*8
-left_sensor = [0]*8
-right_sensor = [0]*8
-
-trail = []
-
-packet_count = 0
+WHITE = (240, 240, 240)
+GREEN = (0, 255, 120)
+BLUE = (0, 170, 255)
+RED = (255, 80, 80)
+ORANGE = (255, 180, 0)
+GRAY = (50, 52, 60)
+BLACK_LINE = (15, 15, 15)
 
 # =========================================
-# NODE SYSTEM
+# TRẠNG THÁI PHÂN TRANG (TAB SYSTEM)
 # =========================================
+current_tab = "CONTROL" # Mặc định hiển thị trang CONTROL chứa các nút bấm gốc
 
+# =========================================
+# CẤU HÌNH TỈ LỆ VẬT LÝ THỰC TẾ (SCALE SYSTEM)
+# =========================================
+MAP_REAL_SIZE_MM = 8000  # Kích thước thực tế của sân đấu: 8000x8000mm (8m x 8m)
+ROBOT_REAL_SIZE_MM = 500  # Kích thước thực tế của Robot: 500x500mm (0.5m x 0.5m)
+
+# Khung giới hạn hiển thị sân đấu (Dạng hình vuông để tương thích tỉ lệ thực tế)
+MAP_WIDTH = min(WIDTH - 420, HEIGHT - 100)
+MAP_HEIGHT = MAP_WIDTH
+MAP_X = 50
+MAP_Y = 50
+
+# Hệ số quy đổi từ mm sang pixels hiển thị
+SCALE_MM_TO_PX = MAP_WIDTH / MAP_REAL_SIZE_MM
+
+# =========================================
+# HỆ THỐNG TOẠ ĐỘ NODE BẢN ĐỒ GỐC (ẢO) VÀ QUY ĐỔI SANG MM THỰC TẾ
+# =========================================
 nodes = {
-
-    # LEFT
-    "A": (170,120),
-    "B": (170,250),
-    "C": (170,350),
-    "D": (170,470),
-    "E": (170,620),
-
-    # CENTER
-    "F": (500,120),
-    "G": (500,160),
-    "H": (500,260),
-    "I": (500,350),
-    "J": (500,450),
-    "K": (500,540),
-    "L": (500,620),
-
-    # RIGHT
-    "M": (830,120),
-    "N": (830,250),
-    "O": (830,350),
-    "P": (830,470),
-    "Q": (830,620)
+    "A": (170, 120),
+    "B": (170, 250),
+    "C": (170, 350),
+    "D": (170, 470),
+    "E": (170, 620),
+    "F": (500, 120),
+    "G": (500, 160),
+    "H": (500, 260),
+    "I": (500, 350),
+    "J": (500, 450),
+    "K": (500, 540),
+    "L": (500, 620),
+    "M": (830, 120),
+    "N": (830, 250),
+    "O": (830, 350),
+    "P": (830, 470),
+    "Q": (830, 620)
 }
 
+# Tạo danh sách toạ độ node thực tế (đơn vị mm) để tính toán mô phỏng vật lý chính xác
+nodes_mm = {}
+for name, (vx, vy) in nodes.items():
+    # Co dãn toạ độ ảo (1000x700) sang đầy đủ phạm vi thực tế (8000x8000mm)
+    nodes_mm[name] = (vx * 8.0, vy * (8000.0 / 700.0))
+
 # =========================================
-# ROBOT MODE
+# TRẠNG THÁI ROBOT (LƯU TRỮ HOÀN TOÀN TRÊN KHÔNG GIAN MM THỰC TẾ)
 # =========================================
+robot_x = nodes_mm["A"][0] # Tọa độ X của robot (mm)
+robot_y = nodes_mm["A"][1] # Tọa độ Y của robot (mm)
+robot_yaw = 0.0
+robot_roll = 0.0
+robot_pitch = 0.0
+
+# Dữ liệu từ 4 laser VL53L0X (đơn vị: cm nhận từ ESP32)
+front_distance = 0
+back_distance = 0
+left_distance = 0
+right_distance = 0
+
+# Nhị phân trạng thái 32 mắt dò line
+front_sensor = [0] * 8
+back_sensor  = [0] * 8
+left_sensor  = [0] * 8
+right_sensor = [0] * 8
+
+# Vận tốc thực tế của bánh xe (RPM) và Xung Encoders
+motor_speeds = [0.0] * 4
+motor_encs = [0] * 4
+
+# Sức khỏe kết nối phần cứng chính từ ESP32 Master
+health_tca  = False
+health_mpu  = False
+health_mega = False
+health_line = False
+
+# Sức khỏe kết nối riêng biệt của 4 cảm biến Laser ToF
+health_vl53 = [False, False, False, False] # Mảng trạng thái kết nối [Front, Back, Left, Right]
+
+# Biến bổ trợ thống kê
+packet_count = 0
+trail = []
 
 robot_mode = "RED"
-
-# =========================================
-# ROUTES
-# =========================================
-
-red_route = [
-    "A","B","C","I","O","P","Q"
-]
-
-blue_route = [
-    "M","N","O","I","C","D","E"
-]
-
+red_route = ["A", "B", "C", "I", "O", "P", "Q"]
+blue_route = ["M", "N", "O", "I", "C", "D", "E"]
 current_route = red_route
-
 current_target_index = 0
-
-robot_speed = 2.0
-
+robot_speed = 35.0 # Vận tốc chạy mô phỏng (mm/khung hình) ~ 2.1 m/s ở 60 FPS
 robot_running = False
 robot_pause = False
 
 # =========================================
-# GRID
+# VẼ LƯỚI KHÔNG GIAN (GRID MAP)
 # =========================================
-
 def draw_grid():
-
     for x in range(0, WIDTH - 400, 40):
-
-        pygame.draw.line(
-            screen,
-            GRID,
-            (x,0),
-            (x,HEIGHT)
-        )
-
+        pygame.draw.line(screen, GRID, (x, 0), (x, HEIGHT))
     for y in range(0, HEIGHT, 40):
-
-        pygame.draw.line(
-            screen,
-            GRID,
-            (0,y),
-            (WIDTH - 400,y)
-        )
+        pygame.draw.line(screen, GRID, (0, y), (WIDTH - 400, y))
 
 # =========================================
-# MAP
+# VẼ SƠ ĐỒ SÂN ĐẤU ROBOCON GỐC VÀ CO GIÃN TỈ LỆ
 # =========================================
 def draw_map():
-
-    map_x = 50
-    map_y = 50
-
-    map_width = WIDTH - 500
-    map_height = HEIGHT - 100
-
-    # =====================================
-    # COLORS
-    # =====================================
-    border_color = (180,120,255)
-
-    line_color = (0,0,0)
-
-    glow_color = (80,80,80)
-
-    node_color = (0,255,255)
-
-    slope_color = (255,105,180)
-
-    green_zone = (60,220,80)
-
-    red_zone = (255,80,80)
-
-    blue_zone = (70,120,255)
-
-    map_fill = (45,45,55)
-
-    # =====================================
-    # MAP BACKGROUND
-    # =====================================
-    pygame.draw.rect(
-        screen,
-        map_fill,
-        (map_x,map_y,map_width,map_height)
-    )
-
-    # =====================================
-    # BORDER
-    # =====================================
-    pygame.draw.rect(
-        screen,
-        border_color,
-        (map_x,map_y,map_width,map_height),
-        4
-    )
-
-    # =====================================
-    # SCALE
-    # =====================================
-    sx = map_width / 1000
-    sy = map_height / 700
-
-    # =====================================
-    # POSITION HELPER
-    # =====================================
-    def P(x,y):
-
-        return (
-            map_x + int(x*sx),
-            map_y + int(y*sy)
-        )
-
-    # =====================================
-    # LINE FUNCTION
-    # =====================================
-    def line(a,b):
-
-        pygame.draw.line(
-            screen,
-            line_color,
-            a,
-            b,
-            6
-        )
-
-    # =====================================
-    # NODE FUNCTION
-    # =====================================
-    def node(pos):
-
-        pygame.draw.circle(
-            screen,
-            node_color,
-            pos,
-            10
-        )
-
-    # =====================================
-    # LEFT SIDE
-    # =====================================
-
-    # verticals
-    line(P(120,80), P(120,620))
-    line(P(200,80), P(200,620))
-
-    # horizontals
-    line(P(120,180), P(200,180))
-    line(P(120,280), P(200,280))
-    line(P(120,420), P(200,420))
-    line(P(120,520), P(200,520))
-
-    # =====================================
-    # RIGHT SIDE
-    # =====================================
-
-    # verticals
-    line(P(800,80), P(800,620))
-    line(P(880,80), P(880,620))
-
-    # horizontals
-    line(P(800,180), P(880,180))
-    line(P(800,280), P(880,280))
-    line(P(800,420), P(880,420))
-    line(P(800,520), P(880,520))
-
-    # =====================================
-    # CENTER RECTANGLE
-    # =====================================
-
-    # left
-    line(P(430,80), P(430,620))
-
-    # right
-    line(P(570,80), P(570,620))
-
-    # center
-    line(P(500,80), P(500,620))
-
-    # top close
-    line(P(430,80), P(570,80))
-
-    # bottom close
-    line(P(430,620), P(570,620))
-
-    # upper horizontal
-    line(P(310,160), P(690,160))
-
-    # upper middle
-    line(P(430,260), P(570,260))
-
-    # lower middle
-    line(P(430,450), P(570,450))
-
-    # lower horizontal
-    line(P(310,540), P(690,540))
-
-    # =====================================
-    # MAIN HORIZONTAL CENTER
-    # =====================================
-    line(
-        P(200,350),
-        P(800,350)
-    )
-
-    # =====================================
-    # UPPER CONNECTIONS
-    # =====================================
-    line(
-        P(350,160),
-        P(430,160)
-    )
-
-    line(
-        P(570,160),
-        P(650,160)
-    )
-
-    # =====================================
-    # LOWER CONNECTIONS
-    # =====================================
-    line(
-        P(350,540),
-        P(430,540)
-    )
-
-    line(
-        P(570,540),
-        P(650,540)
-    )
-
-    # =====================================
-    # LEFT NODES
-    # =====================================
-    left_nodes = [
-
-        (120,80),
-        (120,230),
-        (120,350),
-        (120,470),
-        (120,620)
-    ]
-
-    # =====================================
-    # RIGHT NODES
-    # =====================================
-    right_nodes = [
-
-        (880,80),
-        (880,230),
-        (880,350),
-        (880,470),
-        (880,620)
-    ]
-
-    # =====================================
-    # CENTER NODES
-    # =====================================
-    center_nodes = [
-
-        (500,80),
-        (500,160),
-        (500,260),
-        (500,350),
-        (500,450),
-        (500,540),
-        (500,620)
-    ]
-
-    # draw left nodes
-    for n in left_nodes:
-
-        node(P(n[0], n[1]))
-
-    # draw right nodes
-    for n in right_nodes:
-
-        node(P(n[0], n[1]))
-
-    # draw center nodes
-    for n in center_nodes:
-
-        node(P(n[0], n[1]))
-
-    # middle nodes
-    node(P(200,350))
-    node(P(800,350))
-
-    # =====================================
-    # START ZONES
-    # =====================================
-
-    # RED ZONES
-    pygame.draw.rect(
-        screen,
-        red_zone,
-        (
-            P(155,30)[0],
-            P(150,7)[1],
-            int(90*sx),
-            int(75*sy)
-        ),
-        4
-    )
-
-    pygame.draw.rect(
-        screen,
-        red_zone,
-        (
-            P(155,610)[0],
-            P(150,620)[1],
-            int(90*sx),
-            int(75*sy)
-        ),
-        4
-    )
-
-    # BLUE ZONES
-    pygame.draw.rect(
-        screen,
-        blue_zone,
-        (
-            P(755,30)[0],
-            P(760,7)[1],
-            int(90*sx),
-            int(75*sy)
-        ),
-        4
-    )
-
-    pygame.draw.rect(
-        screen,
-        blue_zone,
-        (
-            P(755,610)[0],
-            P(760,620)[1],
-            int(90*sx),
-            int(75*sy)
-        ),
-        4
-    )
-
-    # =====================================
-    # GREEN ZONES
-    # =====================================
-    green_boxes = [
-
-        # upper left
-        (280,130),
-
-        # upper right
-        (680,130),
-
-        # lower left
-        (280,510),
-
-        # lower right
-        (680,510)
-    ]
-
-    for gx,gy in green_boxes:
-
-        pygame.draw.rect(
-            screen,
-            green_zone,
-            (
-                P(gx,gy)[0],
-                P(gx,gy)[1],
-                int(40*sx),
-                int(60*sy)
-            ),
-            4
-        )
-
-    # =====================================
-    # SLOPES (PINK)
-    # =====================================
-    slopes = [
-
-        # left slope
-        (260,300),
-
-        # right slope
-        (680,300)
-    ]
-
-    for sxp,syp in slopes:
-
-        pygame.draw.rect(
-            screen,
-            slope_color,
-            (
-                P(sxp,syp)[0],
-                P(sxp,syp)[1],
-                int(60*sx),
-                int(100*sy)
-            ),
-            4
-        )
-
-    # =====================================
-    # NODE LABELS
-    # =====================================
-
-    node_positions = {
-
-        # LEFT
-        "A": P(120,80),
-        "B": P(120,230),
-        "C": P(120,350),
-        "D": P(120,470),
-        "E": P(120,620),
-
-        # CENTER
-        "F": P(500,80),
-        "G": P(500,160),
-        "H": P(500,260),
-        "I": P(500,350),
-        "J": P(500,450),
-        "K": P(500,540),
-        "L": P(500,620),
-
-        # RIGHT
-        "M": P(880,80),
-        "N": P(880,230),
-        "O": P(880,350),
-        "P": P(880,470),
-        "Q": P(880,620),
-
-        # MIDDLE
-        "X": P(200,350),
-        "Y": P(800,350)
-    }
-
-    for name, pos in node_positions.items():
-
-        # NODE
-        pygame.draw.circle(
-            screen,
-            node_color,
-            pos,
-            10
-        )
-
-        # TEXT
-        txt = font.render(
-            name,
-            True,
-            (10,10,10)
-        )
-
-        txt_rect = txt.get_rect(center=pos)
-
+    border_color = (180, 120, 255)
+    line_color = (0, 0, 0)
+    node_color = (0, 255, 255)
+    slope_color = (255, 105, 180)
+    green_zone = (60, 220, 80)
+    red_zone = (255, 80, 80)
+    blue_zone = (70, 120, 255)
+    map_fill = (45, 45, 55)
+
+    # Vẽ nền sân thi đấu hình vuông đúng chuẩn 8x8m
+    pygame.draw.rect(screen, map_fill, (MAP_X, MAP_Y, MAP_WIDTH, MAP_HEIGHT))
+    pygame.draw.rect(screen, border_color, (MAP_X, MAP_Y, MAP_WIDTH, MAP_HEIGHT), 4)
+
+    # Hàm P: Ánh xạ chuyển đổi toạ độ vẽ ảo (1000x700) sang màn hình Pygame (pixel) đúng tỉ lệ 8000x8000mm
+    def P(x_v, y_v):
+        x_mm = x_v * 8.0
+        y_mm = y_v * (8000.0 / 700.0)
+        return (MAP_X + int(x_mm * SCALE_MM_TO_PX), MAP_Y + int(y_mm * SCALE_MM_TO_PX))
+
+    # Định nghĩa hàm helper vẽ đường thẳng cục bộ để sửa lỗi NameError
+    def line(start_pos, end_pos):
+        pygame.draw.line(screen, line_color, start_pos, end_pos, 6)
+
+    # Cánh bên trái
+    line(P(120, 80), P(120, 620))
+    line(P(200, 80), P(200, 620))
+    line(P(120, 180), P(200, 180))
+    line(P(120, 280), P(200, 280))
+    line(P(120, 420), P(200, 420))
+    line(P(120, 520), P(200, 520))
+
+    # Cánh bên phải
+    line(P(800, 80), P(800, 620))
+    line(P(880, 80), P(880, 620))
+    line(P(800, 180), P(880, 180))
+    line(P(800, 280), P(880, 280))
+    line(P(800, 420), P(880, 420))
+    line(P(800, 520), P(880, 520))
+
+    # Khu vực trung tâm
+    line(P(430, 80), P(430, 620))
+    line(P(570, 80), P(570, 620))
+    line(P(500, 80), P(500, 620))
+    line(P(430, 80), P(570, 80))
+    line(P(430, 620), P(570, 620))
+    line(P(310, 160), P(690, 160))
+    line(P(430, 260), P(570, 260))
+    line(P(430, 450), P(570, 450))
+    line(P(310, 540), P(690, 540))
+
+    line(P(200, 350), P(800, 350))
+    line(P(350, 160), P(430, 160))
+    line(P(570, 160), P(650, 160))
+    line(P(350, 540), P(430, 540))
+    line(P(570, 540), P(650, 540))
+
+    # Khung các vùng xuất phát & Khu vực đặc biệt
+    pygame.draw.rect(screen, red_zone, (P(155, 30)[0], P(150, 7)[1], int(90 * 8 * SCALE_MM_TO_PX), int(75 * (8000/700) * SCALE_MM_TO_PX)), 4)
+    pygame.draw.rect(screen, red_zone, (P(155, 610)[0], P(150, 620)[1], int(90 * 8 * SCALE_MM_TO_PX), int(75 * (8000/700) * SCALE_MM_TO_PX)), 4)
+    pygame.draw.rect(screen, blue_zone, (P(755, 30)[0], P(760, 7)[1], int(90 * 8 * SCALE_MM_TO_PX), int(75 * (8000/700) * SCALE_MM_TO_PX)), 4)
+    pygame.draw.rect(screen, blue_zone, (P(755, 610)[0], P(760, 620)[1], int(90 * 8 * SCALE_MM_TO_PX), int(75 * (8000/700) * SCALE_MM_TO_PX)), 4)
+
+    for gx, gy in [(280, 130), (680, 130), (280, 510), (680, 510)]:
+        pygame.draw.rect(screen, green_zone, (P(gx, gy)[0], P(gx, gy)[1], int(40 * 8 * SCALE_MM_TO_PX), int(60 * (8000/700) * SCALE_MM_TO_PX)), 4)
+
+    for sxp, syp in [(260, 300), (680, 300)]:
+        pygame.draw.rect(screen, slope_color, (P(sxp, syp)[0], P(sxp, syp)[1], int(60 * 8 * SCALE_MM_TO_PX), int(100 * (8000/700) * SCALE_MM_TO_PX)), 4)
+
+    # Vẽ và dán nhãn các Nodes
+    for name, pos in nodes_mm.items():
+        scr_pos = (MAP_X + int(pos[0] * SCALE_MM_TO_PX), MAP_Y + int(pos[1] * SCALE_MM_TO_PX))
+        pygame.draw.circle(screen, node_color, scr_pos, 10)
+        txt = font.render(name, True, (10, 10, 10))
+        txt_rect = txt.get_rect(center=scr_pos)
         screen.blit(txt, txt_rect)
 
-
 # =========================================
-# ROBOT
+# VẼ ROBOT VÀ CÁC TIA LASER KHỎANG CÁCH CHUẨN XÁC VẬT LÝ
 # =========================================
 def draw_robot(x, y, yaw):
+    # Tính kích thước pixels hiển thị của Robot dựa trên kích thước thật 500x500mm
+    robot_size_px = max(24, int(ROBOT_REAL_SIZE_MM * SCALE_MM_TO_PX))
+    robot_surface = pygame.Surface((robot_size_px * 2, robot_size_px * 2), pygame.SRCALPHA)
+    
+    # Quy đổi tọa độ của robot sang pixels
+    scr_x = MAP_X + int(x * SCALE_MM_TO_PX)
+    scr_y = MAP_Y + int(y * SCALE_MM_TO_PX)
 
-    # robot dài hơn
-    robot_surface = pygame.Surface((50,65), pygame.SRCALPHA)
-
-    # =====================================
-    # SHADOW
-    # =====================================
-    pygame.draw.rect(
-        robot_surface,
-        (0,0,0,60),
-        (8,10,34,45),
-        border_radius=4
-    )
-
-    # =====================================
-    # MAIN BODY
-    # =====================================
-    pygame.draw.rect(
-        robot_surface,
-        (55,60,70),
-        (10,10,30,45),
-        border_radius=3
-    )
-
-    # =====================================
-    # TOP PANEL
-    # =====================================
-    pygame.draw.rect(
-        robot_surface,
-        (35,40,45),
-        (15,16,20,32),
-        border_radius=2
-    )
-
-    # =====================================
-    # MECANUM WHEELS
-    # =====================================
-    wheel_positions = [
-
-        (3,14),
-        (41,14),
-
-        (3,38),
-        (41,38)
+    # Thân robot (Sát với tỉ lệ thực tế)
+    center_pt = robot_size_px
+    body_w = int(robot_size_px * 0.7)
+    body_h = int(robot_size_px * 0.9)
+    
+    # Thân chính (Chassis)
+    pygame.draw.rect(robot_surface, (55, 60, 70), (center_pt - body_w//2, center_pt - body_h//2, body_w, body_h), border_radius=int(body_w * 0.15))
+    pygame.draw.rect(robot_surface, BLUE, (center_pt - body_w//2, center_pt - body_h//2, body_w, body_h), 2, border_radius=int(body_w * 0.15))
+    
+    # Khoang vi điều khiển trung tâm
+    pygame.draw.rect(robot_surface, (30, 32, 40), (center_pt - body_w//3, center_pt - body_h//4, (body_w*2)//3, body_h//2), border_radius=4)
+    
+    # Bánh xe Mecanum (4 bánh)
+    wheel_w = max(4, int(robot_size_px * 0.15))
+    wheel_h = max(8, int(robot_size_px * 0.35))
+    
+    wheel_offsets = [
+        (center_pt - body_w//2 - wheel_w//2, center_pt - body_h//2),
+        (center_pt + body_w//2 - wheel_w//2, center_pt - body_h//2),
+        (center_pt - body_w//2 - wheel_w//2, center_pt + body_h//2 - wheel_h),
+        (center_pt + body_w//2 - wheel_w//2, center_pt + body_h//2 - wheel_h)
     ]
+    for wx, wy in wheel_offsets:
+        pygame.draw.rect(robot_surface, (120, 120, 120), (wx, wy, wheel_w, wheel_h), border_radius=2)
+        pygame.draw.rect(robot_surface, (40, 40, 40), (wx, wy, wheel_w, wheel_h), 1, border_radius=2)
 
-    for wx,wy in wheel_positions:
+    # Chỉ thị chiều mũi tên và cảm biến la bàn
+    pygame.draw.circle(robot_surface, RED, (center_pt, center_pt), 4)
+    pygame.draw.line(robot_surface, BLUE, (center_pt, center_pt), (center_pt, center_pt - body_h//2 + 5), 2)
+    pygame.draw.polygon(robot_surface, BLUE, [(center_pt, center_pt - body_h//2), (center_pt - 4, center_pt - body_h//2 + 6), (center_pt + 4, center_pt - body_h//2 + 6)])
 
-        # wheel body
-        pygame.draw.rect(
-            robot_surface,
-            (85,85,85),
-            (wx,wy,6,14),
-            border_radius=1
-        )
-
-        # mecanum rollers
-        for i in range(3):
-
-            pygame.draw.line(
-                robot_surface,
-                (140,140,140),
-                (wx, wy+i*4),
-                (wx+6, wy+2+i*4),
-                1
-            )
-
-    # =====================================
-    # MPU6050
-    # =====================================
-    pygame.draw.circle(
-        robot_surface,
-        (255,80,80),
-        (25,32),
-        3
-    )
-
-    # =====================================
-    # FRONT ARROW
-    # =====================================
-    pygame.draw.line(
-        robot_surface,
-        (0,255,255),
-        (25,32),
-        (25,14),
-        2
-    )
-
-    pygame.draw.polygon(
-        robot_surface,
-        (0,255,255),
-        [
-            (25,10),
-            (22,15),
-            (28,15)
-        ]
-    )
-
-    # =====================================
-    # STATUS LEDS
-    # =====================================
-    pygame.draw.circle(
-        robot_surface,
-        (0,255,120),
-        (18,32),
-        2
-    )
-
-    pygame.draw.circle(
-        robot_surface,
-        (0,170,255),
-        (32,32),
-        2
-    )
-
-    # =====================================
-    # ROTATE
-    # =====================================
-    rotated = pygame.transform.rotate(
-        robot_surface,
-        -yaw
-    )
-
-    rect = rotated.get_rect(
-        center=(x,y)
-    )
-
+    # Xoay robot tương tác động góc la bàn thực tế
+    rotated = pygame.transform.rotate(robot_surface, -yaw)
+    rect = rotated.get_rect(center=(scr_x, scr_y))
     screen.blit(rotated, rect)
 
+    # -------------------------------------
+    # VẼ CÁC TIA LASER CHUẨN KÍCH THƯỚC CHUẨN VẬT LÝ VỚI SÂN (mm)
+    # -------------------------------------
+    if connected_status:
+        yaw_rad = math.radians(yaw)
+        
+        # Bán kính bán vật lý của Robot (500mm / 2 = 250mm)
+        ROBOT_RADIUS_MM = 250
+        
+        # 1. Tia FRONT
+        f_len_px = (ROBOT_RADIUS_MM + front_distance * 10) * SCALE_MM_TO_PX
+        fx = scr_x + math.sin(yaw_rad) * f_len_px
+        fy = scr_y - math.cos(yaw_rad) * f_len_px
+        pygame.draw.line(screen, RED, (scr_x, scr_y), (int(fx), int(fy)), 1)
+        pygame.draw.circle(screen, RED, (int(fx), int(fy)), 4)
+        
+        # 2. Tia BACK
+        b_len_px = (ROBOT_RADIUS_MM + back_distance * 10) * SCALE_MM_TO_PX
+        bx = scr_x - math.sin(yaw_rad) * b_len_px
+        by = scr_y + math.cos(yaw_rad) * b_len_px
+        pygame.draw.line(screen, RED, (scr_x, scr_y), (int(bx), int(by)), 1)
+        pygame.draw.circle(screen, RED, (int(bx), int(by)), 4)
+
+        # 3. Tia LEFT
+        l_len_px = (ROBOT_RADIUS_MM + left_distance * 10) * SCALE_MM_TO_PX
+        lx = scr_x - math.cos(yaw_rad) * l_len_px
+        ly = scr_y - math.sin(yaw_rad) * l_len_px
+        pygame.draw.line(screen, RED, (scr_x, scr_y), (int(lx), int(ly)), 1)
+        pygame.draw.circle(screen, RED, (int(lx), int(ly)), 4)
+
+        # 4. Tia RIGHT
+        r_len_px = (ROBOT_RADIUS_MM + right_distance * 10) * SCALE_MM_TO_PX
+        rx = scr_x + math.cos(yaw_rad) * r_len_px
+        ry = scr_y + math.sin(yaw_rad) * r_len_px
+        pygame.draw.line(screen, RED, (scr_x, scr_y), (int(rx), int(ry)), 1)
+        pygame.draw.circle(screen, RED, (int(rx), int(ry)), 4)
+
 # =========================================
-# SENSOR BAR
+# CHỈ THỊ BÓNG LED DÒ LINE (SATELLITE BARS)
 # =========================================
 def draw_sensor_bar(data, x, y):
-
-    for i,val in enumerate(data):
-
+    for i, val in enumerate(data):
         color = GREEN if val else GRAY
-
-        pygame.draw.circle(
-            screen,
-            color,
-            (x + i*26, y),
-            8
-        )
+        pygame.draw.circle(screen, color, (x + i * 26, y), 8)
+        num_txt = font.render(str(i+1), True, (100, 100, 105))
+        screen.blit(num_txt, (x - 4 + i * 26, y + 12))
 
 # =========================================
-# PANEL
+# BẢNG ĐIỀU KHIỂN ĐA TRANG (TABBED RIGHT PANEL)
 # =========================================
 def draw_panel():
-
     panel_x = WIDTH - 360
+    # Bo khung nền Panel chính
+    pygame.draw.rect(screen, PANEL, (panel_x, 20, 340, HEIGHT - 40), border_radius=20)
 
-    pygame.draw.rect(
-        screen,
-        PANEL,
-        (panel_x,20,340,HEIGHT - 40),
-        border_radius=20
-    )
+    # -------------------------------------
+    # THIẾT KẾ TAB HEADER (CLICKABLE TABS)
+    # -------------------------------------
+    tabs = ["CONTROL", "SENSORS", "HARDWARE"]
+    tab_start_x = panel_x + 15
+    tab_y = 35
 
-    title = big_font.render(
-        "AGV ROBOT",
-        True,
-        WHITE
-    )
+    for i, tab_name in enumerate(tabs):
+        tab_rect = pygame.Rect(tab_start_x + i * 105, tab_y, 100, 35)
+        bg_color = TAB_ACTIVE if current_tab == tab_name else TAB_INACTIVE
+        pygame.draw.rect(screen, bg_color, tab_rect, border_radius=6)
+        
+        txt_color = BLACK_LINE if current_tab == tab_name else WHITE
+        txt = tab_font.render(tab_name, True, txt_color)
+        txt_rect = txt.get_rect(center=tab_rect.center)
+        screen.blit(txt, txt_rect)
 
-    screen.blit(title, (panel_x + 30,40))
+    pygame.draw.line(screen, GRAY, (panel_x + 15, 82), (panel_x + 325, 82), 1)
 
-    sub = font.render(
-        "ESP32 SIMULATION",
-        True,
-        BLUE
-    )
+    # -------------------------------------
+    # TRANG 1: ĐIỀU KHIỂN CHẠY VÀ SÂN ĐẤU GỐC
+    # -------------------------------------
+    if current_tab == "CONTROL":
+        # Connection status indicator
+        conn_color = GREEN if connected_status else RED
+        conn_text  = "USB TELEMETRY: ONLINE" if connected_status else "USB TELEMETRY: OFFLINE"
+        pygame.draw.circle(screen, conn_color, (panel_x + 35, 115), 6)
+        status = font.render(conn_text, True, conn_color)
+        screen.blit(status, (panel_x + 50, 106))
 
-    screen.blit(sub, (panel_x + 30,80))
+        # Đèn báo kết nối hệ thống vi điều khiển chính
+        pygame.draw.line(screen, GRAY, (panel_x + 15, 135), (panel_x + 325, 135), 1)
+        sys_title = font.render("SYS HEALTH:", True, BLUE)
+        screen.blit(sys_title, (panel_x + 25, 142))
 
-    # status
-    pygame.draw.circle(
-        screen,
-        GREEN,
-        (panel_x + 35,125),
-        7
-    )
+        h_labels = [("TCA", health_tca), ("IMU", health_mpu), ("MEGA", health_mega), ("LINE", health_line)]
+        for i, (name, state) in enumerate(h_labels):
+            h_color = GREEN if state else RED
+            pygame.draw.circle(screen, h_color, (panel_x + 35 + i * 75, 175), 5)
+            h_txt = font.render(name, True, h_color)
+            screen.blit(h_txt, (panel_x + 45 + i * 75, 166))
 
-    status = font.render(
-        "CONNECTED",
-        True,
-        GREEN
-    )
+        # Đèn báo kết nối riêng rẽ của 4 cảm biến Laser ToF (Tránh đè chữ)
+        pygame.draw.line(screen, GRAY, (panel_x + 15, 195), (panel_x + 325, 195), 1)
+        vl_title = font.render("VL53 SENSORS:", True, BLUE)
+        screen.blit(vl_title, (panel_x + 25, 202))
 
-    screen.blit(status, (panel_x + 50,115))
+        vl_labels = [("FRONT", health_vl53[0]), ("BACK", health_vl53[1]), ("LEFT", health_vl53[2]), ("RIGHT", health_vl53[3])]
+        for i, (name, state) in enumerate(vl_labels):
+            h_color = GREEN if state else RED
+            pygame.draw.circle(screen, h_color, (panel_x + 35 + i * 75, 235), 5)
+            h_txt = font.render(name, True, h_color)
+            screen.blit(h_txt, (panel_x + 45 + i * 75, 226))
 
-    # info
-    info = [
+        # Tiêu đề bảng điều khiển mô phỏng gốc
+        sim_info_y = 265
+        pygame.draw.line(screen, GRAY, (panel_x + 15, sim_info_y - 10), (panel_x + 325, sim_info_y - 10), 1)
+        
+        sim_title = big_font.render("SIMULATION CTRL", True, WHITE)
+        screen.blit(sim_title, (panel_x + 30, sim_info_y))
 
-        f"Yaw: {robot_yaw:.1f}°",
-        f"Front Distance: {front_distance} cm",
-        f"Back Distance: {back_distance} cm",
-        f"Packets: {packet_count}"
-    ]
+        # Các nút bấm gốc (Đã đồng bộ hóa toạ độ Y theo biến toàn cục BUTTON_Y chống đè chéo)
+        buttons = [
+            ("START", GREEN),
+            ("PAUSE", ORANGE),
+            ("STOP", RED)
+        ]
+        for i, (name, color) in enumerate(buttons):
+            btn_rect = pygame.Rect(panel_x + 30, BUTTON_Y + i * 50, 120, 35)
+            pygame.draw.rect(screen, color, btn_rect, border_radius=8)
+            txt = font.render(name, True, BLACK_LINE)
+            txt_rect = txt.get_rect(center=btn_rect.center)
+            screen.blit(txt, txt_rect)
 
-    start_y = 180
+        # Trực quan hóa cấu hình chọn Sân RED / BLUE
+        pygame.draw.rect(screen, RED, (panel_x + 180, BUTTON_Y, 120, 35), border_radius=8)
+        txt_red = font.render("RED FIELD", True, WHITE)
+        screen.blit(txt_red, (panel_x + 201, BUTTON_Y + 8))
 
-    for i,text in enumerate(info):
+        pygame.draw.rect(screen, BLUE, (panel_x + 180, BUTTON_Y + 50, 120, 35), border_radius=8)
+        txt_blue = font.render("BLUE FIELD", True, WHITE)
+        screen.blit(txt_blue, (panel_x + 198, BUTTON_Y + 58))
 
-        txt = font.render(
-            text,
-            True,
-            WHITE
-        )
+        # Dải hiển thị trạng thái sân đang chạy
+        mode_text = font.render(f"ACTIVE FIELD: {robot_mode}", True, WHITE)
+        screen.blit(mode_text, (panel_x + 180, BUTTON_Y + 108))
 
-        screen.blit(
-            txt,
-            (panel_x + 30, start_y + i*40)
-        )
+        # Target Node hiển thị
+        if current_target_index < len(current_route):
+            target = current_route[current_target_index]
+            txt_tar = big_font.render(f"TARGET: Node {target}", True, GREEN)
+            screen.blit(txt_tar, (panel_x + 30, HEIGHT - 85))
 
-    # sensor labels
-    labels = [
+    # -------------------------------------
+    # TRANG 2: THEO DÕI 32 MẮT DÒ LINE (SENSORS)
+    # -------------------------------------
+    elif current_tab == "SENSORS":
+        sensor_title = big_font.render("32-CH LINE DETECT", True, BLUE)
+        screen.blit(sensor_title, (panel_x + 30, 105))
 
-        ("FRONT", front_sensor),
-        ("BACK", back_sensor),
-        ("LEFT", left_sensor),
-        ("RIGHT", right_sensor)
-    ]
+        labels = [
+            ("MẶT TRƯỚC (FRONT - F1..F8)", front_sensor),
+            ("MẶT SAU (BACK - B1..B8)", back_sensor),
+            ("MẶT TRÁI (LEFT - L1..L8)", left_sensor),
+            ("MẶT PHẢI (RIGHT - R1..R8)", right_sensor)
+        ]
 
-    sy = 380
+        sy = 160
+        for i, (name, data) in enumerate(labels):
+            txt = font.render(name, True, WHITE)
+            screen.blit(txt, (panel_x + 30, sy + i * 95))
+            
+            box_rect = pygame.Rect(panel_x + 20, sy + 25 + i * 95, 300, 45)
+            pygame.draw.rect(screen, BG, box_rect, border_radius=10)
+            pygame.draw.rect(screen, GRAY, box_rect, 1, border_radius=10)
+            
+            draw_sensor_bar(data, panel_x + 40, sy + 45 + i * 95)
 
-    for i,(name,data) in enumerate(labels):
+    # -------------------------------------
+    # TRANG 3: THÔNG SỐ ĐO KHÔNG GIAN (HARDWARE)
+    # -------------------------------------
+    elif current_tab == "HARDWARE":
+        hw_title = big_font.render("HARDWARE STATUS", True, ORANGE)
+        screen.blit(hw_title, (panel_x + 30, 105))
 
-        txt = font.render(
-            name,
-            True,
-            WHITE
-        )
+        # 1. Khung hiển thị IMU La bàn số
+        imu_y = 155
+        pygame.draw.rect(screen, BG, (panel_x + 20, imu_y, 300, 100), border_radius=10)
+        pygame.draw.rect(screen, GRAY, (panel_x + 20, imu_y, 300, 100), 1, border_radius=10)
+        
+        imu_title = font.render("IMU YAW / ROLL / PITCH", True, BLUE)
+        screen.blit(imu_title, (panel_x + 35, imu_y + 10))
+        
+        txt_yaw = font.render(f"Yaw Góc Quay : {robot_yaw:.2f}°", True, WHITE)
+        screen.blit(txt_yaw, (panel_x + 35, imu_y + 35))
+        
+        txt_rp = font.render(f"Roll: {robot_roll:.1f}°   |   Pitch: {robot_pitch:.1f}°", True, WHITE)
+        screen.blit(txt_rp, (panel_x + 35, imu_y + 65))
 
-        screen.blit(
-            txt,
-            (panel_x + 30, sy + i*70)
-        )
+        # 2. Khung hiển thị cảm biến laser VL53L0X
+        laser_y = 275
+        pygame.draw.rect(screen, BG, (panel_x + 20, laser_y, 300, 115), border_radius=10)
+        pygame.draw.rect(screen, GRAY, (panel_x + 20, laser_y, 300, 115), 1, border_radius=10)
+        
+        laser_title = font.render("VL53L0X LASER DISTANCE (cm)", True, BLUE)
+        screen.blit(laser_title, (panel_x + 35, laser_y + 10))
+        
+        txt_lf = font.render(f"Trước (F) : {front_distance:<5} |  Sau (B) : {back_distance}", True, WHITE)
+        screen.blit(txt_lf, (panel_x + 35, laser_y + 40))
+        
+        txt_lr = font.render(f"Trái  (L) : {left_distance:<5} |  Phải (R) : {right_distance}", True, WHITE)
+        screen.blit(txt_lr, (panel_x + 35, laser_y + 75))
 
-        draw_sensor_bar(
-            data,
-            panel_x + 40,
-            sy + 30 + i*70
-        )
-     
-    # =====================================
-    # BUTTONS
-    # =====================================
+        # 3. Khung hiển thị tốc độ vòng quay bánh xe RPM thực tế
+        rpm_y = 410
+        pygame.draw.rect(screen, BG, (panel_x + 20, rpm_y, 300, 105), border_radius=10)
+        pygame.draw.rect(screen, GRAY, (panel_x + 20, rpm_y, 300, 105), 1, border_radius=10)
+        
+        motor_title = font.render("MOTOR REAL-TIME SPEED (RPM)", True, BLUE)
+        screen.blit(motor_title, (panel_x + 35, rpm_y + 10))
+        
+        txt_m12 = font.render(f"Bánh Trước: FL: {motor_speeds[0]:.1f}  | FR: {motor_speeds[1]:.1f}", True, WHITE)
+        screen.blit(txt_m12, (panel_x + 35, rpm_y + 40))
+        
+        txt_m34 = font.render(f"Bánh Sau   : RL: {motor_speeds[2]:.1f}  | RR: {motor_speeds[3]:.1f}", True, WHITE)
+        screen.blit(txt_m34, (panel_x + 35, rpm_y + 70))
 
-    button_y = HEIGHT - 260
-
-    buttons = [
-
-        ("START", GREEN),
-        ("PAUSE", (255,200,0)),
-        ("STOP", RED)
-    ]
-
-    for i,(name,color) in enumerate(buttons):
-
-        pygame.draw.rect(
-            screen,
-            color,
-            (
-                panel_x + 30,
-                button_y + i*60,
-                120,
-                40
-            ),
-            border_radius=10
-        )
-
-        txt = font.render(
-            name,
-            True,
-            BLACK_LINE
-        )
-
-        screen.blit(
-            txt,
-            (
-                panel_x + 60,
-                button_y + 12 + i*60
-            )
-        )
-
-    # =====================================
-    # MODE
-    # =====================================
-
-    mode_text = font.render(
-        f"MODE: {robot_mode}",
-        True,
-        WHITE
-    )
-
-    screen.blit(
-        mode_text,
-        (panel_x + 180, HEIGHT - 240)
-    )
-
-    # RED MODE BUTTON
-    pygame.draw.rect(
-        screen,
-        (255,80,80),
-        (panel_x + 180, HEIGHT - 200, 120, 40),
-        border_radius=10
-    )
-
-    txt = font.render(
-        "RED FIELD",
-        True,
-        WHITE
-    )
-
-    screen.blit(
-        txt,
-        (panel_x + 195, HEIGHT - 188)
-    )
-
-    # BLUE MODE BUTTON
-    pygame.draw.rect(
-        screen,
-        (70,120,255),
-        (panel_x + 180, HEIGHT - 145, 120, 40),
-        border_radius=10
-    )
-
-    txt = font.render(
-        "BLUE FIELD",
-        True,
-        WHITE
-    )
-
-    screen.blit(
-        txt,
-        (panel_x + 190, HEIGHT - 133)
-    )
-
-    # =====================================
-    # CURRENT TARGET
-    # =====================================
-
-    if current_target_index < len(current_route):
-
-        target = current_route[current_target_index]
-
-        txt = font.render(
-            f"TARGET NODE: {target}",
-            True,
-            GREEN
-        )
-
-        screen.blit(
-            txt,
-            (panel_x + 30, HEIGHT - 60)
-        )
+        # 4. Gói tin nhận được
+        pkt_text = font.render(f"Gói tin Telemetry đã nhận: {packet_count}", True, GRAY)
+        screen.blit(pkt_text, (panel_x + 30, HEIGHT - 55))
 
 # =========================================
-# AUTO NAVIGATION
+# ĐIỀU HƯỚNG MÔ PHỎNG TỰ ĐỘNG GỐC (AUTO NAV)
 # =========================================
 def auto_navigation():
+    global robot_x, robot_y, robot_yaw, current_target_index
 
-    global robot_x
-    global robot_y
-    global robot_yaw
-    global current_target_index
-
-    if not robot_running:
-        return
-
-    if robot_pause:
+    if not robot_running or robot_pause:
         return
 
     if current_target_index >= len(current_route):
         return
 
     target_name = current_route[current_target_index]
-
-    tx, ty = nodes[target_name]
+    tx, ty = nodes_mm[target_name] # Tọa độ mục tiêu thực tế (mm)
 
     dx = tx - robot_x
     dy = ty - robot_y
-
     distance = math.sqrt(dx*dx + dy*dy)
 
-    # tới node
-    if distance < 5:
-
+    # Chạm đích khi khoảng cách nhỏ hơn 40mm (4cm)
+    if distance < 40:
         current_target_index += 1
         return
 
     dx /= distance
     dy /= distance
 
+    # Di chuyển robot mượt mà trong không gian thực (mm)
     robot_x += dx * robot_speed
     robot_y += dy * robot_speed
-
-    robot_yaw = math.degrees(
-        math.atan2(dx, -dy)
-    )
+    
+    # Chỉ giả lập hướng xoay khi xe không kết nối trực tiếp với robot thật
+    if not connected_status:
+        robot_yaw = math.degrees(math.atan2(dx, -dy))
 
 # =========================================
-# MAIN LOOP
+# VÒNG LẶP CHẠY CHÍNH (MAIN PROGRAM LOOP)
 # =========================================
 running = True
 
 while running:
-
     clock.tick(60)
 
-    # =====================================
-    # RECEIVE UDP
-    # =====================================
-    try:
-
-        data, addr = sock.recvfrom(4096)
-
-        msg = json.loads(data.decode())
-
-        robot_x = msg["x"]
-        robot_y = msg["y"]
-        robot_yaw = msg["yaw"]
-
-        front_distance = msg["front_distance"]
-        back_distance = msg["back_distance"]
-
-        front_sensor = msg["front"]
-        back_sensor = msg["back"]
-        left_sensor = msg["left"]
-        right_sensor = msg["right"]
-
-        trail.append((robot_x, robot_y))
-
-        if len(trail) > 1000:
-            trail.pop(0)
-
-        packet_count += 1
-
-    except:
-        pass
+    # Tự động quét tìm kết nối USB Serial nếu bị lỏng dây cáp
+    if SERIAL_AVAILABLE and not connected_status:
+        find_and_connect_serial()
 
     # =====================================
-    # EVENTS
+    # ĐỌC GIẢI MÃ CHUỖI TELEMETRY NHẬN TỪ USB SERIAL
+    # =====================================
+    if SERIAL_AVAILABLE and ser is not None and ser.is_open:
+        try:
+            while ser.in_waiting > 0:
+                line_data = ser.readline().decode('utf-8', errors='ignore').strip()
+                # Chỉ xử lý các chuỗi JSON hợp lệ được bắt đầu bằng { và kết thúc bằng }
+                if line_data.startswith('{') and line_data.endswith('}'):
+                    msg = json.loads(line_data)
+
+                    # Đồng bộ hóa góc quay vật lý của IMU thực tế
+                    robot_yaw   = msg["yaw"]
+                    robot_roll  = msg.get("roll", 0.0)
+                    robot_pitch = msg.get("pitch", 0.0)
+
+                    # Cập nhật giá trị khoảng cách của 4 mắt laser ToF
+                    front_distance = msg["front_distance"]
+                    back_distance  = msg["back_distance"]
+                    left_distance  = msg.get("left_distance", 0)
+                    right_distance = msg.get("right_distance", 0)
+
+                    # Cập nhật trạng thái logic của 32 mắt dò line
+                    front_sensor = msg["front"]
+                    back_sensor  = msg["back"]
+                    left_sensor  = msg["left"]
+                    right_sensor = msg["right"]
+
+                    # Cập nhật RPM thực tế của bánh Mecanum và Xung Encoders
+                    motor_speeds = msg.get("speed", [0.0]*4)
+                    motor_encs   = msg.get("enc", [0]*4)
+
+                    # Cập nhật trạng thái sống/chết của các linh kiện trên robot
+                    health_data = msg.get("health", {})
+                    health_tca  = health_data.get("tca", False)
+                    health_mpu  = health_data.get("mpu", False)
+                    health_mega = health_data.get("mega", False)
+                    health_line = health_data.get("line", False)
+                    health_vl53[0] = health_data.get("vl53_f", False)
+                    health_vl53[1] = health_data.get("vl53_b", False)
+                    health_vl53[2] = health_data.get("vl53_l", False)
+                    health_vl53[3] = health_data.get("vl53_r", False)
+
+                    # Thêm tọa độ vết di chuyển thực tế (mép bánh xe)
+                    trail.append((robot_x, robot_y))
+                    if len(trail) > 1000:
+                        trail.pop(0)
+
+                    packet_count += 1
+                    connected_status = True
+                    last_packet_time = pygame.time.get_ticks()
+
+        except Exception as e:
+            pass
+
+    # Nếu quá 1.5 giây không có tín hiệu phản hồi từ robot, tự động ngắt kết nối COM để chờ dò lại
+    if SERIAL_AVAILABLE and connected_status and (pygame.time.get_ticks() - last_packet_time > 1500):
+        connected_status = False
+        try:
+            if ser:
+                ser.close()
+            ser = None
+        except:
+            pass
+
+    # =====================================
+    # XỬ LÝ SỰ KIỆN CLICK CHUỘT / BÀN PHÍM
     # =====================================
     for event in pygame.event.get():
-
         if event.type == pygame.QUIT:
             running = False
 
         if event.type == pygame.KEYDOWN:
-
             if event.key == pygame.K_ESCAPE:
                 running = False
 
-   # =====================================
-   # MOUSE
-   # =====================================
-    if event.type == pygame.MOUSEBUTTONDOWN:
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            mx, my = pygame.mouse.get_pos()
+            panel_x = WIDTH - 360
 
-       mx,my = pygame.mouse.get_pos()
+            # ---------------------------------
+            # SỰ KIỆN CLICK CHUYỂN TAB HEADER
+            # ---------------------------------
+            tab_y = 35
+            if tab_y <= my <= tab_y + 35:
+                # Tab 1: CONTROL
+                if panel_x + 15 <= mx <= panel_x + 115:
+                    current_tab = "CONTROL"
+                # Tab 2: SENSORS
+                elif panel_x + 120 <= mx <= panel_x + 220:
+                    current_tab = "SENSORS"
+                # Tab 3: HARDWARE
+                elif panel_x + 225 <= mx <= panel_x + 325:
+                    current_tab = "HARDWARE"
 
-       panel_x = WIDTH - 360
+            # ---------------------------------
+            # SỰ KIỆN CLICK BUTTONS GỐC (Chỉ cho phép khi ở Tab CONTROL)
+            # ---------------------------------
+            if current_tab == "CONTROL":
+                # START BUTTON CLICK
+                if panel_x + 30 <= mx <= panel_x + 150:
+                    if BUTTON_Y <= my <= BUTTON_Y + 35:
+                        robot_running = True
+                        robot_pause = False
 
-       # START
-       if panel_x + 30 <= mx <= panel_x + 150:
+                # PAUSE BUTTON CLICK
+                if panel_x + 30 <= mx <= panel_x + 150:
+                    if BUTTON_Y + 50 <= my <= BUTTON_Y + 85:
+                        robot_pause = not robot_pause
 
-           if HEIGHT - 260 <= my <= HEIGHT - 220:
+                # STOP BUTTON CLICK (Sử dụng thống nhất biến BUTTON_Y toàn cục)
+                if panel_x + 30 <= mx <= panel_x + 150:
+                    if BUTTON_Y + 100 <= my <= BUTTON_Y + 135:
+                        robot_running = False
+                        current_target_index = 0
+                        if robot_mode == "RED":
+                            robot_x, robot_y = nodes_mm["A"]
+                        else:
+                            robot_x, robot_y = nodes_mm["M"]
 
-               robot_running = True
-               robot_pause = False
+                # RED FIELD SELECTION (Đồng bộ nút bấm sang biến toàn cục BUTTON_Y)
+                if panel_x + 180 <= mx <= panel_x + 300:
+                    if BUTTON_Y <= my <= BUTTON_Y + 35:
+                        robot_mode = "RED"
+                        current_route = red_route
+                        robot_x, robot_y = nodes_mm["A"]
+                        current_target_index = 0
 
-       # PAUSE
-       if panel_x + 30 <= mx <= panel_x + 150:
+                # BLUE FIELD SELECTION (Sử dụng BUTTON_Y + 50 thống nhất)
+                if panel_x + 180 <= mx <= panel_x + 300:
+                    if BUTTON_Y + 50 <= my <= BUTTON_Y + 85:
+                        robot_mode = "BLUE"
+                        current_route = blue_route
+                        robot_x, robot_y = nodes_mm["M"]
+                        current_target_index = 0
 
-           if HEIGHT - 200 <= my <= HEIGHT - 160:
-
-               robot_pause = not robot_pause
-
-       # STOP
-       if panel_x + 30 <= mx <= panel_x + 150:
-
-           if HEIGHT - 140 <= my <= HEIGHT - 100:
-
-               robot_running = False
-               current_target_index = 0
-
-               if robot_mode == "RED":
-
-                   robot_x, robot_y = nodes["A"]
-
-               else:
-
-                   robot_x, robot_y = nodes["M"]
-
-       # RED MODE
-       if panel_x + 180 <= mx <= panel_x + 300:
-
-           if HEIGHT - 200 <= my <= HEIGHT - 160:
-
-               robot_mode = "RED"
-
-               current_route = red_route
-
-               robot_x, robot_y = nodes["A"]
-
-               current_target_index = 0
-
-       # BLUE MODE
-       if panel_x + 180 <= mx <= panel_x + 300:
-
-           if HEIGHT - 145 <= my <= HEIGHT - 105:
-
-               robot_mode = "BLUE"
-
-               current_route = blue_route
-
-               robot_x, robot_y = nodes["M"]
-
-               current_target_index = 0
-    # =====================================
-    # AUTO NAVIGATION
-    # =====================================
+    # Chạy thuật toán di chuyển mô phỏng tự hành
     auto_navigation()
 
     # =====================================
-    # DRAW
+    # RENDER ĐỒ HỌA MÀN HÌNH
     # =====================================
     screen.fill(BG)
-
     draw_grid()
-
     draw_map()
 
-    # trail
+    # Vẽ vệt di chuyển (Trail) của AGV chuyển đổi từ mm sang pixel hiển thị
     for p in trail:
+        screen_tx = MAP_X + int(p[0] * SCALE_MM_TO_PX)
+        screen_ty = MAP_Y + int(p[1] * SCALE_MM_TO_PX)
+        pygame.draw.circle(screen, GREEN, (screen_tx, screen_ty), 2)
 
-        pygame.draw.circle(
-            screen,
-            GREEN,
-            p,
-            2
-        )
+    # Convert tọa độ thực tế mm của robot sang tọa độ Pixel hiển thị
+    screen_robot_x = MAP_X + int(robot_x * SCALE_MM_TO_PX)
+    screen_robot_y = MAP_Y + int(robot_y * SCALE_MM_TO_PX)
 
-    # robot
-    draw_robot(
-        robot_x,
-        robot_y,
-        robot_yaw
-    )
+    # Vẽ robot bám theo góc xoay Yaw IMU vật lý thực tế
+    draw_robot(robot_x, robot_y, robot_yaw)
 
-    # right panel
+    # Vẽ panel thông số đa trang chống đè chữ
     draw_panel()
 
     pygame.display.flip()
